@@ -9,6 +9,8 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from clinic_localizer.cohorts.protocol import Decision, DomainRecord, ContractError, canonical_json, stable_hash, utc_now
 from clinic_localizer.governance.use_scope import prepare_scopes, register_scope, link_cohort, issue_scope, restrict_scope, scope_history
+from clinic_localizer.governance import two_stage
+from clinic_localizer.statistics.two_stage_metrics import CohortObservation
 
 
 SCHEMA = """
@@ -85,6 +87,7 @@ class Repository:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             prepare_scopes(connection)
+            two_stage.prepare_two_stage(connection)
 
     def register_scope(self, scope_id: str, group: str, purpose: str) -> None:
         with self.transaction() as connection:
@@ -105,6 +108,82 @@ class Repository:
     def scope_history(self, scope_id: str) -> dict[str, Any]:
         with self.connect() as connection:
             return scope_history(connection, scope_id)
+
+    # ------------------------------------------------------------------ #
+    # 两阶段验证：候选选择与独立确认
+    # ------------------------------------------------------------------ #
+    def create_cycle(self, cycle_id: str, product_code: str, intended_use: str,
+                     context: Mapping[str, Any] | None = None) -> None:
+        with self.transaction() as connection:
+            two_stage.create_cycle(connection, cycle_id, product_code, intended_use, context)
+
+    def assign_split(self, cycle_id: str, split_role: str,
+                     observations: Sequence[CohortObservation]) -> None:
+        with self.transaction() as connection:
+            two_stage.assign_split(connection, cycle_id, split_role, observations)
+
+    def record_candidate(self, cycle_id: str, model_id: str, operating_threshold: float,
+                         observations: Sequence[CohortObservation] | None = None,
+                         context: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        with self.transaction() as connection:
+            result = two_stage.record_candidate(
+                connection, cycle_id, model_id, operating_threshold, observations, context)
+            self.append_event(connection, "candidate.recorded", cycle_id,
+                              self.event_count(cycle_id, connection) + 1,
+                              {"candidate_key": result["candidate_key"]})
+            return result
+
+    def freeze_selection(self, cycle_id: str, expected_model_id: str | None = None,
+                         expected_operating_threshold: float | None = None,
+                         context: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        with self.transaction() as connection:
+            decision = two_stage.freeze_selection(
+                connection, cycle_id, expected_model_id, expected_operating_threshold, context)
+            self.append_event(connection, "selection.frozen", cycle_id,
+                              self.event_count(cycle_id, connection) + 1,
+                              {"model_id": decision["selected_model_id"],
+                               "operating_threshold": decision["selected_operating_threshold"]})
+            return decision
+
+    def submit_confirmation(self, review_id: str, cycle_id: str,
+                            observations: Sequence[CohortObservation],
+                            context: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        with self.transaction() as connection:
+            review = two_stage.submit_confirmation(
+                connection, review_id, cycle_id, observations, context)
+            self.append_event(connection, "confirmation.submitted", cycle_id,
+                              self.event_count(cycle_id, connection) + 1,
+                              {"review_id": review_id, "tuning_allowed": False})
+            return review
+
+    def issue_acceptance(self, acceptance_id: str, cycle_id: str,
+                         context: Mapping[str, Any] | None = None,
+                         allow_limited: bool = False) -> dict[str, Any]:
+        with self.transaction() as connection:
+            result = two_stage.issue_acceptance(
+                connection, acceptance_id, cycle_id, context, allow_limited)
+            self.append_event(connection, "acceptance.issued", cycle_id,
+                              self.event_count(cycle_id, connection) + 1,
+                              {"acceptance_id": acceptance_id, "outcome": result["outcome"],
+                               "basis_hash": result["basis_hash"]})
+            return result
+
+    def restrict_acceptance(self, restriction_id: str, acceptance_id: str, trigger_type: str,
+                            reason: str, detail: Mapping[str, Any] | Sequence[Any] | None = None) -> None:
+        with self.transaction() as connection:
+            two_stage.restrict_acceptance(
+                connection, restriction_id, acceptance_id, trigger_type, reason, detail)
+            self.append_event(connection, "acceptance.restricted", acceptance_id,
+                              self.event_count(acceptance_id, connection) + 1,
+                              {"restriction_id": restriction_id, "trigger_type": trigger_type})
+
+    def basis_drift_report(self, cycle_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            return two_stage.basis_drift_report(connection, cycle_id)
+
+    def cycle_history(self, cycle_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            return two_stage.cycle_history(connection, cycle_id)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -254,8 +333,12 @@ class Repository:
 
     def snapshot(self) -> dict[str, Any]:
         with self.connect() as connection:
+            tables = ("records", "record_versions", "decisions", "events", "runs",
+                      "validation_cycles", "cycle_splits", "candidate_evaluations",
+                      "selection_decisions", "confirmation_reviews",
+                      "safety_acceptances", "acceptance_restrictions")
             counts = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                      for table in ("records", "record_versions", "decisions", "events", "runs")}
+                      for table in tables}
             states = {row[0]: row[1] for row in connection.execute("SELECT state,COUNT(*) FROM records GROUP BY state")}
         return {"counts": counts, "states": states, "chain_errors": self.verify_chain()}
 
